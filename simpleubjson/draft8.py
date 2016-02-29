@@ -9,6 +9,7 @@
 
 from decimal import Decimal
 from struct import pack, unpack
+from uuid import UUID
 from . import NOOP as NOOP_SENTINEL
 from .compat import (
     BytesIO, b, bytes, unicode, basestring, long, xrange,
@@ -36,10 +37,12 @@ STRING_L = b('S')
 HIDEF_S = b('h')
 HIDEF_L = b('H')
 ARRAY_S = b('a')
-OBJECT_S = b('o')
 ARRAY_L = b('A')
+OBJECT_S = b('o')
 OBJECT_L = b('O')
 FF = b(chr(255))
+DICTIONARY = b('\x80')
+UUID_ = b('U')
 
 BOS_A = object()
 BOS_O = object()
@@ -50,10 +53,19 @@ STRINGS = set([STRING_S, STRING_L, HIDEF_S, HIDEF_L])
 SHORT_OBJ = set([STRING_S, HIDEF_S, ARRAY_S, OBJECT_S])
 LARGE_OBJ = set([STRING_L, HIDEF_L, ARRAY_L, OBJECT_L])
 STREAMS = set([ARRAY_S, OBJECT_S])
-OBJECT_KEYS = set([STRING_S, STRING_L])
+OBJECT_KEYS = set([STRING_S, STRING_L, TRUE, FALSE, NULL]) | NUMBERS
 FORBIDDEN = set([NOOP, EOS])
 
 CHARS = dict((i, b(chr(i))) for i in range(256))
+
+IS_DICTIONARY_BIT = 0x80
+DICTIONARY_SHORT = 0x80
+DICTIONARY_LONG = 0xC0
+DICTIONARY_TYPE_MASK = 0xC0
+DICTIONARY_INDEX_MASK = 0x3F
+
+def is_dictionary(tag):
+    return bool(tag and ord(tag) & IS_DICTIONARY_BIT)
 
 __all__ = ['Draft8Decoder', 'Draft8Encoder']
 
@@ -122,13 +134,15 @@ class Draft8Decoder(object):
 
     dispatch = {}
 
-    def __init__(self, source, allow_noop=False):
+    def __init__(self, source, allow_noop=False, dictionary=None):
         if isinstance(source, unicode):
             source = source.encode('utf-8')
         if isinstance(source, bytes):
             source = BytesIO(source)
+        self.source = source
         self.read = source.read
         self.allow_noop = allow_noop
+        self.dictionary = dictionary
         self.dispatch = self.dispatch.copy()
 
     def __iter__(self):
@@ -136,6 +150,9 @@ class Draft8Decoder(object):
 
     def next_tlv(self):
         tag = self.read(1)
+        if not tag:
+            return None, None, None
+
         while tag == NOOP and not self.allow_noop:
             tag = self.read(1)
         if tag in NUMBERS:
@@ -174,6 +191,14 @@ class Draft8Decoder(object):
             return tag, length, None
         elif tag in CONSTANTS:
             return tag, None, None
+        elif is_dictionary(tag):
+            return DICTIONARY, None, tag
+        elif tag == UUID_:
+            # packed as two longs
+            _, _, value1 = self.next_tlv()
+            _, _, value2 = self.next_tlv()
+            value = pack('>qq', value1, value2)
+            return tag, None, value
         elif not tag:
             raise EarlyEndOfStreamError('nothing to decode')
         else:
@@ -181,6 +206,8 @@ class Draft8Decoder(object):
 
     def decode_next(self):
         tag, length, value = self.next_tlv()
+        if not tag:
+            return None
         return self.dispatch[tag](self, tag, length, value)
 
     __next__ = next = decode_next
@@ -224,8 +251,6 @@ class Draft8Decoder(object):
     dispatch[HIDEF_L] = decode_hidef
 
     def decode_array(self, tag, length, value):
-        if tag == ARRAY_S and length == 255:
-            return self.decode_array_stream(tag, length, value)
         res = [None] * length
         next_tlv = self.next_tlv
         dispatch = self.dispatch
@@ -236,16 +261,12 @@ class Draft8Decoder(object):
             if tag in forbidden:
                 raise MarkerError('invalid marker occurs: %02X' % ord(tag))
             item = dispatch[tag](self, tag, length, value)
-            if tag in streams and length == 255:
-                item = list(item)
             res[_] = item
         return res
     dispatch[ARRAY_S] = decode_array
     dispatch[ARRAY_L] = decode_array
 
     def decode_object(self, tag, length, value):
-        if tag == OBJECT_S and length == 255:
-            return self.decode_object_stream(tag, length, value)
         res = {}
         key = None
         next_tlv = self.next_tlv
@@ -257,72 +278,36 @@ class Draft8Decoder(object):
             tag, length, value = next_tlv()
             if tag in forbidden:
                 raise MarkerError('invalid marker found: %02X' % ord(tag))
-            if key is None and tag not in object_keys:
+            if key is None and not (tag in object_keys or is_dictionary(tag)):
                 raise MarkerError('key should be string, got %r' % (tag))
             value = dispatch[tag](self, tag, length, value)
             if key is None:
                 key = value
             else:
-                if tag in streams and length == 255:
-                    value = list(value)
                 res[key] = value
                 key = None
         return res
     dispatch[OBJECT_S] = decode_object
     dispatch[OBJECT_L] = decode_object
 
-    def decode_array_stream(self, tag, length, value):
-        dispatch = self.dispatch
-        next_tlv = self.next_tlv
-        eos = EOS
-        streams = STREAMS
-        def array_stream():
-            while 1:
-                tag, length, value = next_tlv()
-                if tag == eos:
-                    break
-                item = dispatch[tag](self, tag, length, value)
-                if tag in streams and length == 255:
-                    yield list(item)
-                else:
-                    yield item
-        return array_stream()
+    def decode_dictionary(self, tag, length, value):
+        assert self.dictionary, 'Dictionary tag without a dictionary?'
 
-    def decode_object_stream(self, tag, length, value):
-        dispatch = self.dispatch
-        next_tlv = self.next_tlv
-        eos = EOS
-        object_keys = OBJECT_KEYS
-        noop = NOOP
-        noop_sentinel = NOOP_SENTINEL
-        streams = STREAMS
-        def object_stream():
-            key = None
-            while 1:
-                tag, length, value = next_tlv()
-                if tag == noop and key is None:
-                    yield noop_sentinel, noop_sentinel
-                elif tag == NOOP and key:
-                    continue
-                elif tag == eos:
-                    if key:
-                        raise EarlyEndOfStreamError('value missed for key %r'
-                                                    % key)
-                    break
-                elif key is None and tag not in object_keys:
-                    raise MarkerError('key should be string, got %r' % (tag))
-                else:
-                    value = dispatch[tag](self, tag, length, value)
-                    if key is None:
-                        key = value
-                    elif tag in streams:
-                        yield key, list(value)
-                        key = None
-                    else:
-                        yield key, value
-                        key = None
-        return object_stream()
+        value = ord(value)
 
+        if value & DICTIONARY_TYPE_MASK == DICTIONARY_SHORT:
+            # single byte
+            index = value & DICTIONARY_INDEX_MASK
+        else:
+            # two byte entry
+            second = ord(self.read(1))
+            index = ((value & DICTIONARY_INDEX_MASK) << 8) | second
+        return self.dictionary[index]
+    dispatch[DICTIONARY] = decode_dictionary
+
+    def decode_uuid(self, tag, length, value):
+        return str(UUID(bytes=value))
+    dispatch[UUID_] = decode_uuid
 
 class Draft8Encoder(object):
     """Encoder of Python objects into UBJSON data following Draft 8
